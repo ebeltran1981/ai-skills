@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "bash ./scripts/hooks/require-readme-on-new-skill.sh",
+        "timeout": 10
+      }
+    ]
+  }
+}
