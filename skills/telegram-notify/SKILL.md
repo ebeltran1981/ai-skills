@@ -1,119 +1,131 @@
 ---
 name: telegram-notify
-description: Send Telegram notifications reliably for scripts, apps, and one-off alerts using environment-based defaults.
-argument-hint: What notification text should be sent, and do you need to override default env-based routing?
+description: "Send Telegram bot notifications and adaptively poll for user replies, with per-job reply routing. Use when a workflow needs to notify the user at key checkpoints and react to replies without mixing responses from concurrent jobs."
 ---
 
 # Telegram Notify
 
-Use this skill when Telegram is used as a notification system.
+Send notifications and watch for user replies in the same Telegram chat. Supports multiple concurrent agents by routing Telegram replies to per-job inboxes: each agent only sees replies the user directed at it.
 
-## Outcome
+Uses an adaptive polling cadence — quiet when idle, faster right after the user posts something, then backs off smoothly to the idle rhythm.
 
-Produce a working notification implementation (or one-off command) that:
-- Uses Telegram Bot API `sendMessage`
-- Uses `TELEGRAM_BOT_API_KEY` for auth
-- Uses `TELEGRAM_BOT_CHAT_ID` as the default destination chat
-- Verifies delivery with response checks
-- Handles common API failures clearly
+## Prerequisites
 
-## Inputs To Collect
+Run `telegram-preflight` first. If env vars are not set, skip silently.
 
-Collect these values before implementation:
-- `TELEGRAM_BOT_API_KEY` (required): bot API key
-- `TELEGRAM_BOT_CHAT_ID` (required): default chat id, group id, or channel id
-- `text` (required): notification body
-- Optional runtime overrides: `chat_id`, `parse_mode`, `disable_web_page_preview`, `disable_notification`, `message_thread_id`
-
-If required environment variables are missing, ask for them before proceeding.
-
-## Decision Flow
-
-1. Choose delivery mode:
-- One-off/manual send: use `curl` command.
-- Application integration: implement in project language (Node, Python, etc.).
-
-2. Choose credential and target source:
-- Default to environment values:
-  - `TELEGRAM_BOT_API_KEY`
-  - `TELEGRAM_BOT_CHAT_ID`
-- If project has a secrets manager, it may populate these env vars.
-
-3. Choose formatting mode:
-- If rich formatting is requested, use `parse_mode` and escape content correctly.
-- If formatting issues appear, fall back to plain text.
-
-4. Validate target:
-- Use `TELEGRAM_BOT_CHAT_ID` unless the user explicitly overrides `chat_id`.
-- If API returns `chat not found` or `bot was blocked`, report an actionable next step.
-
-## Implementation Pattern
-
-### Minimal API contract
-
-- Endpoint: `https://api.telegram.org/bot<TOKEN>/sendMessage`
-- Method: `POST`
-- JSON body:
-  - `chat_id` (required)
-  - `text` (required)
-  - `parse_mode` (optional)
-  - `disable_web_page_preview` (optional)
-  - `disable_notification` (optional)
-
-### One-off command template
+## Quick start
 
 ```bash
-curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_API_KEY}/sendMessage" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "chat_id": "'"${TELEGRAM_BOT_CHAT_ID}"'",
-    "text": "<NOTIFICATION_TEXT>",
-    "disable_web_page_preview": true
-  }'
+# Send a notification and register a job (returns job_id e.g. TREX-1234-a3f2)
+python3 scripts/notify.py send --job-id TREX-1234 "🚀 [TREX-1234] Started: doing the thing"
+
+# Read replies for that job (without consuming)
+python3 scripts/notify.py poll --read-inbox --job-id TREX-1234-a3f2
+
+# Consume (read + clear) replies for that job
+python3 scripts/notify.py poll --consume-inbox --job-id TREX-1234-a3f2
+
+# Drain all pending updates and route them (one-shot, no inbox read)
+python3 scripts/notify.py poll
+
+# Start the adaptive watch loop (blocks — run in background or a separate terminal)
+python3 scripts/notify.py watch &
 ```
 
-When generating a command, keep `TELEGRAM_BOT_API_KEY` and `TELEGRAM_BOT_CHAT_ID` as environment variables.
+## Subcommands
 
-### Integration requirements
+### `send` — deliver a notification
 
-- Build a reusable function/module, for example `sendTelegramNotification(text, options)`.
-- Resolve defaults from env vars:
-  - `apiKey = process.env.TELEGRAM_BOT_API_KEY`
-  - `chatId = options.chatId || process.env.TELEGRAM_BOT_CHAT_ID`
-- Validate required values and throw or return structured errors.
-- Log non-sensitive diagnostic details (`status`, Telegram `description`, request context).
-- Never log full token/API key.
+```bash
+python3 scripts/notify.py send [--job-id TREX-1234] "{MESSAGE}"
+```
 
-## Error Handling Checklist
+Reads message from stdin when called with no positional argument. Outputs JSON with `message_id`, `status`, and `job_id` (when `--job-id` was given).
 
-For non-2xx or `{ "ok": false }` responses:
-- Surface Telegram `error_code` and `description`
-- Classify likely cause:
-  - `401`: invalid API key
-  - `400`: bad request (invalid chat id, malformed parse mode payload)
-  - `403`: bot blocked or unauthorized target
-  - `429`: rate limit (apply backoff and retry)
-- Provide a concrete remediation step per class.
+Options:
+- `--job-id TREX-1234` — JIRA ticket or workflow label. The script appends a 4-char hex suffix (e.g. `TREX-1234-a3f2`) and records the sent `message_id` → `job_id` in a shared registry. Save the returned `job_id` for later inbox reads.
+- `--parse-mode` — Telegram parse mode (`Markdown` by default; pass `none` for plain text).
 
-## Completion Checks
+### `poll` — drain pending updates once
 
-A task is complete only when all apply:
-- `TELEGRAM_BOT_API_KEY` is used for auth
-- `TELEGRAM_BOT_CHAT_ID` is used for default chat routing
-- Notification send path is implemented with `POST /sendMessage`
-- At least one successful send is confirmed (or command is fully ready to run with provided inputs)
-- Error path behavior is defined and user-visible
-- Any new config/env usage is documented in relevant project docs
+```bash
+# Route new updates to per-job inboxes
+python3 scripts/notify.py poll
 
-## Guardrails
+# Read a specific job's inbox
+python3 scripts/notify.py poll --read-inbox --job-id TREX-1234-a3f2
 
-- Do not commit secrets or real API keys.
-- Do not expose API key values in logs, terminal output, or patches.
-- Prefer the smallest viable implementation over framework-heavy abstractions.
-- Keep changes scoped to the user request.
+# Read and clear a specific job's inbox
+python3 scripts/notify.py poll --consume-inbox --job-id TREX-1234-a3f2
+```
 
-## Example Prompts This Skill Should Handle
+One poller drains all pending updates (holding a file lock) and routes each reply to the correct job's private inbox based on Telegram's `reply_to_message_id`. Un-threaded messages are ignored silently. For each job that received replies, an intent summary is sent back as a Telegram reply to the user's last message, threaded in the same conversation.
 
-- "Add a Python notifier that uses `TELEGRAM_BOT_API_KEY` and `TELEGRAM_BOT_CHAT_ID`."
-- "Create a Node utility to send deployment notifications to Telegram with env-based defaults."
-- "Generate a one-off curl command that sends a release notification using my Telegram env vars."
+Options:
+- `--job-id` — required with `--read-inbox` / `--consume-inbox`.
+- `--no-summary-notification` — skip the summary reply.
+
+### `watch` — adaptive-cadence reply loop
+
+```bash
+python3 scripts/notify.py watch &
+```
+
+Runs continuously. The cadence adapts automatically:
+
+| Situation | Next check in |
+|-----------|--------------|
+| No recent activity (idle) | 60 s |
+| Reply detected | 15 s |
+| No reply at 15 s | 30 s |
+| No reply at 30 s | 45 s |
+| No reply at 45 s | back to 60 s |
+
+A new reply at any back-off step resets the cadence to 15 s. Stop with `Ctrl-C` or `kill`.
+
+## Job routing — how multiple agents co-exist
+
+```
+Agent A: send --job-id TREX-100 "..."  →  job_id: TREX-100-a3f2, message_id: 101
+Agent B: send --job-id TREX-200 "..."  →  job_id: TREX-200-9b1c, message_id: 102
+
+User replies to message 101 → "ship it"
+User replies to message 102 → "wait, recheck"
+
+watch (shared) drains both replies, routes:
+  message 101 reply → TREX-100-a3f2 inbox
+  message 102 reply → TREX-200-9b1c inbox
+
+Agent A: poll --consume-inbox --job-id TREX-100-a3f2  →  gets "ship it"
+Agent B: poll --consume-inbox --job-id TREX-200-9b1c  →  gets "wait, recheck"
+```
+
+- Only **reply** messages are routed. Un-threaded messages are ignored.
+- Registry entries expire after **24 hours**.
+- One shared `watch` process handles routing for all jobs. Individual agents only consume their own inbox.
+
+## Message templates
+
+| Event | Template |
+|-------|----------|
+| Workflow started | `🚀 [{CONTEXT}] Started: {description}` |
+| Waiting for user | `⏸️ [{CONTEXT}] Waiting for input — check the chat.` |
+| Success | `✅ [{CONTEXT}] {description}` |
+| Failure (auto-fix) | `🔴 [{CONTEXT}] {description}. Attempting auto-fix...` |
+| Warning | `🟡 [{CONTEXT}] {description}` |
+| Blocked | `🟡 [{CONTEXT}] Blocked: {reason}. Need your input.` |
+| Ticket created | `🎫 [{CONTEXT}] JIRA {TICKET_ID}: {URL}` |
+| PR submitted | `✅ [{CONTEXT}] PR submitted: {PR_URL}` |
+| Revision pushed | `🔄 [{CONTEXT}] Revision pushed. Re-scan triggered.` |
+
+Replace `{CONTEXT}` with the ticket ID or workflow name for traceability. Keep messages under 200 characters for mobile readability.
+
+## Rules
+
+- Never block a workflow because a notification or poll failed.
+- Always check env vars before sending; skip silently if unset.
+- Use Markdown parse mode for formatting (bold, inline code).
+- Always reply to a specific bot message in Telegram; un-threaded messages are ignored.
+- Save the `job_id` returned by `send --job-id` — it is required to read replies later.
+- Run one shared `watch` process; do not start a `watch` per agent.
+- A workflow must explicitly consume its inbox and branch on the result — `watch` does not automatically resume a paused agent session.
